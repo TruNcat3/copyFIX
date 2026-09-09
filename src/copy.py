@@ -11,6 +11,9 @@ from _kunlunxin.utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger("flag_gems").getChild(__name__.lstrip("."))
 
+# wt-2026-09-09-fix <wangt635@ustc.edu.cn>: non-contiguous copy fix.
+# Keep the contiguous fast path unchanged and dispatch strided copies to an
+# explicit stride-aware kernel instead of the broken native fallback.
 _FALLBACK_KEYSET = torch._C.DispatchKeySet(
     torch._C.DispatchKey.CompositeExplicitAutograd
 )
@@ -50,6 +53,7 @@ def _copy_kernel(src):
     return src
 
 
+# wt-2026-09-09-fix <wangt635@ustc.edu.cn>: fixed-rank stride-aware copy kernel.
 @libentry()
 @triton.jit
 def _copy_strided_kernel(
@@ -115,6 +119,7 @@ def _copy_strided_kernel(
     )
 
 
+# wt-2026-09-09-fix <wangt635@ustc.edu.cn>: launch with true src/dst strides.
 def _copy_strided(dst: torch.Tensor, src: torch.Tensor) -> None:
     """Launch the fixed-rank stride-aware copy kernel."""
     assert src.shape == dst.shape
@@ -159,6 +164,7 @@ def _can_use_triton(dst: torch.Tensor, src: torch.Tensor) -> bool:
     return True
 
 
+# wt-2026-09-09-fix <wangt635@ustc.edu.cn>: reject overlapping writes before Triton.
 def _expand_like(src: torch.Tensor, target_shape: torch.Size) -> torch.Tensor:
     if src.shape == target_shape:
         return src
@@ -228,6 +234,7 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
 
     expanded_src = _expand_like(src, dst.shape)
 
+    # wt-2026-09-09-fix <wangt635@ustc.edu.cn>: stride-aware dispatch.
     if (
         not expanded_src.is_contiguous() or not dst.is_contiguous()
     ) and expanded_src.ndim <= _STRIDED_COPY_MAX_RANK:
