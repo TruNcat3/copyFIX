@@ -6,7 +6,7 @@
 torch.AcceleratorError: CUDA error: invalid device function
 ```
 
-一句话版本：**原 KunlunXIN `copy_` 把非连续 source 交给原生 `aten.copy_` fallback；当前 XPU 兼容层的原生非连续 elementwise kernel 不可用。这里改成连续路径保持原样，非连续 rank<=5 走显式 stride-aware Triton kernel，rank>6 继续走已有 pointwise_dynamic 路径。**
+一句话版本：**原 KunlunXIN `copy_` 把非连续 source 交给原生 `aten.copy_` fallback；当前 XPU 兼容层的原生非连续 elementwise kernel 不可用。这里移除 source 必须连续的限制，让 source / destination 的真实 strides 直接交给已有 `pointwise_dynamic` copy kernel。**
 
 ## 问题是怎么回事
 
@@ -44,24 +44,20 @@ torch.ops.aten.copy_.default.redispatch(...)
 
 ## 修复思路
 
-参考 [gatherFIX](https://github.com/TruNcat3/gatherFIX) 的分流结构：
+分流结构：
 
 ```text
-source / destination 是否连续？
-  ├── 连续 ------------------→ 原 pointwise_dynamic 快路径，零改动
-  ├── 非连续且 rank <= 5 ----→ _copy_strided_kernel
-  └── 非连续且 rank > 5 ------→ 原 pointwise_dynamic 动态生成路径
+source / destination 是否可安全走 Triton？
+  ├── 是 --> _copy_kernel.instantiate(rank)
+  └── 否 --> 原 aten.copy_ fallback
 ```
 
-新 kernel 对每个线性元素下标做逐维分解：
+`pointwise_dynamic` 会按 rank 生成 kernel，并携带 source / destination 的真实
+stride 展开 offset，因此不会把非连续 tensor 误当作连续平铺内存；同时沿用
+KunlunXIN 后端的 12-CTA grid/tile 策略。
 
-```text
-offset -> (c0, c1, ..., c4)
-src_offset = Σ ci * src_stride_i
-dst_offset = Σ ci * dst_stride_i
-```
-
-因此 expand、transpose、slice、permute、复合 view，以及非连续 destination 都不会被误当作连续平铺内存。
+因此 expand、transpose、slice、permute、复合 view、非连续 destination，以及高 rank
+输入都走同一条已验证路径。
 
 ## 目录结构
 
@@ -139,7 +135,19 @@ python tests/bench_copy.py
 
 ## 已知边界
 
-- 显式 stride kernel 采用固定 rank 5 签名，rank>5 走已有 `pointwise_dynamic` 路径；
 - complex 转 real 仍保留原生 fallback，以维持 PyTorch warning 语义；
 - 内部重叠 destination 会拒绝写入，与 PyTorch 行为一致；
 - bench 只提供当前机器的趋势观察，不作为严格性能回归结论。
+
+P800 `(1024, 1024)` fp32 观察：
+
+```text
+contiguous aten dispatch:     ~0.039 ms/iter
+expanded aten dispatch:       ~0.039 ms/iter
+expanded direct pointwise:    ~0.023 ms/iter
+旧 fixed-rank stride kernel:  ~3.3   ms/iter
+```
+
+实际 dispatch 与 direct kernel 的差距是 host/dispatch 开销；kernel 本身约提速
+140 倍，完整 `copy_` 调用约提速 85 倍。最终不新增手写 fixed-rank kernel，直接复用
+`pointwise_dynamic`。

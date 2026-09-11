@@ -3,25 +3,15 @@ from typing import Optional
 
 import torch
 import triton
-import triton.language as tl
 
-from flag_gems.utils import libentry
 from _kunlunxin.utils.codegen_config_utils import CodeGenConfig
 from _kunlunxin.utils.pointwise_dynamic import pointwise_dynamic
 
 logger = logging.getLogger("flag_gems").getChild(__name__.lstrip("."))
 
-# wt-2026-09-09-fix <wangt635@ustc.edu.cn>: non-contiguous copy fix.
-# Keep the contiguous fast path unchanged and dispatch strided copies to an
-# explicit stride-aware kernel instead of the broken native fallback.
 _FALLBACK_KEYSET = torch._C.DispatchKeySet(
     torch._C.DispatchKey.CompositeExplicitAutograd
 )
-
-# The dedicated stride-aware kernel has a fixed signature.  Higher-rank copies
-# are handled by the existing pointwise_dynamic code generator instead.
-_STRIDED_COPY_MAX_RANK = 5
-_COPY_BLOCK_SIZE = 1024
 
 config_ = CodeGenConfig(
     512,
@@ -53,100 +43,9 @@ def _copy_kernel(src):
     return src
 
 
-# wt-2026-09-09-fix <wangt635@ustc.edu.cn>: fixed-rank stride-aware copy kernel.
-@libentry()
-@triton.jit
-def _copy_strided_kernel(
-    src_ptr,
-    dst_ptr,
-    shape0,
-    shape1,
-    shape2,
-    shape3,
-    shape4,
-    src_stride0,
-    src_stride1,
-    src_stride2,
-    src_stride3,
-    src_stride4,
-    dst_stride0,
-    dst_stride1,
-    dst_stride2,
-    dst_stride3,
-    dst_stride4,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """Copy with explicit source/destination strides.
-
-    The flat element index is decomposed into coordinates over ``shape``.  A
-    missing dimension is padded with shape one and stride zero by the host
-    wrapper, so it contributes neither a coordinate nor an offset.
-    """
-    offset = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
-    mask = offset < n_elements
-
-    remaining = offset
-    coord0 = remaining % shape0
-    remaining = remaining // shape0
-    coord1 = remaining % shape1
-    remaining = remaining // shape1
-    coord2 = remaining % shape2
-    remaining = remaining // shape2
-    coord3 = remaining % shape3
-    remaining = remaining // shape3
-    coord4 = remaining % shape4
-
-    src_offset = (
-        coord0 * src_stride0
-        + coord1 * src_stride1
-        + coord2 * src_stride2
-        + coord3 * src_stride3
-        + coord4 * src_stride4
-    )
-    dst_offset = (
-        coord0 * dst_stride0
-        + coord1 * dst_stride1
-        + coord2 * dst_stride2
-        + coord3 * dst_stride3
-        + coord4 * dst_stride4
-    )
-    value = tl.load(src_ptr + src_offset, mask=mask, other=0)
-    tl.store(
-        dst_ptr + dst_offset,
-        value.to(dst_ptr.type.element_ty),
-        mask=mask,
-    )
-
-
-# wt-2026-09-09-fix <wangt635@ustc.edu.cn>: launch with true src/dst strides.
-def _copy_strided(dst: torch.Tensor, src: torch.Tensor) -> None:
-    """Launch the fixed-rank stride-aware copy kernel."""
-    assert src.shape == dst.shape
-    assert src.ndim <= _STRIDED_COPY_MAX_RANK
-
-    def pad_shapes(values):
-        return tuple(values) + (1,) * (_STRIDED_COPY_MAX_RANK - len(values))
-
-    def pad_strides(values):
-        return tuple(values) + (0,) * (_STRIDED_COPY_MAX_RANK - len(values))
-
-    shapes = pad_shapes(src.shape)
-    src_strides = pad_strides(src.stride())
-    dst_strides = pad_strides(dst.stride())
-    n_elements = src.numel()
-    grid = lambda meta: (triton.cdiv(n_elements, meta["BLOCK_SIZE"]),)
-    _copy_strided_kernel[grid](
-        src,
-        dst,
-        *shapes,
-        *src_strides,
-        *dst_strides,
-        n_elements,
-        BLOCK_SIZE=_COPY_BLOCK_SIZE,
-    )
-
-
+# wt-2026-09-11-perf <wangt635@ustc.edu.cn>: non-contiguous sources are valid
+# pointwise inputs.  Keep them on the tuned generated kernel instead of falling
+# back to the broken native path or a slower hand-written fixed-rank kernel.
 def _can_use_triton(dst: torch.Tensor, src: torch.Tensor) -> bool:
     if dst.layout != torch.strided or src.layout != torch.strided:
         return False
@@ -234,13 +133,9 @@ def copy_(dst: torch.Tensor, src: torch.Tensor, non_blocking: bool = False):
 
     expanded_src = _expand_like(src, dst.shape)
 
-    # wt-2026-09-09-fix <wangt635@ustc.edu.cn>: stride-aware dispatch.
-    if (
-        not expanded_src.is_contiguous() or not dst.is_contiguous()
-    ) and expanded_src.ndim <= _STRIDED_COPY_MAX_RANK:
-        _copy_strided(dst, expanded_src)
-        return dst
-
+    # The generated pointwise kernel already carries true source/destination
+    # strides and uses the KunlunXIN-tuned grid/tile policy.  Benchmarks on P800
+    # show it is substantially faster than launching the fixed-rank fallback.
     overload = _copy_kernel.instantiate(expanded_src.ndim)
     overload(expanded_src, out0=dst)
     return dst

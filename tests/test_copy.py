@@ -130,7 +130,7 @@ def test_copy_expanded_source_rank_coverage(rank):
 
 
 @pytest.mark.copy_
-def test_copy_rank_six_uses_pointwise_dynamic_fallback():
+def test_copy_rank_six_expanded_source():
     shape = (2,) * 6
     seed_shape = (1,) + shape[1:]
     src = torch.randn(seed_shape, dtype=torch.float32, device=flag_gems.device).expand(

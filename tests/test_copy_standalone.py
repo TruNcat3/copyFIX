@@ -38,7 +38,7 @@ def load_operator():
 op = load_operator()
 print(f"testing copy_ operator from: {op.__file__}")
 assert hasattr(op, "copy_")
-assert hasattr(op, "_copy_strided_kernel"), "this copy.py does not contain the fix"
+assert hasattr(op, "_copy_kernel"), "this copy.py does not contain the copy kernel"
 
 device = flag_gems.device
 PASS = 0

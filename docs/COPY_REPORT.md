@@ -36,60 +36,74 @@ if not _can_use_triton(dst, src):
 - `a.expand(4, 128)` 同 dtype copy：失败；
 - `a.expand(4, 128)` 到 bf16：同一路径失败；
 - 临时移除 `src.is_contiguous()` 限制后，已有 `pointwise_dynamic` copy 可通过，说明 Triton 路线可行；
-- 为了避免影响连续快路径，并使实现与 gatherFIX 一样明确、可测，最终新增固定 rank 的显式 stride-aware kernel。
+- 性能复测发现 direct `pointwise_dynamic` 明显快于第一版 fixed-rank kernel，最终方案为移除连续性限制并复用该生成 kernel。
 
 ## 新实现
 
+### 性能定位（2026-09-11）
+
+在 P800、`(1024, 1024)` fp32 上观察到：
+
+```text
+copy contiguous: 0.040 ms/iter
+copy expanded:   2.408 ms/iter   # 第一版 fixed-rank kernel
+```
+
+补充对比 direct `_copy_strided` 与 FlagGems 生成 `_copy_kernel` 后，结论更直接：
+
+```text
+contiguous via aten dispatch:     ~0.039 ms/iter
+expanded via aten dispatch:       ~0.039 ms/iter
+expanded via direct pointwise:    ~0.023 ms/iter
+expanded via fixed-rank kernel:   ~3.3   ms/iter
+```
+
+`pointwise_dynamic` 不是只能处理连续输入。它生成 kernel 时同时传入 source /
+destination 的真实 strides，并使用 KunlunXIN 后端调优过的 12-CTA grid/tile
+策略，且 shape/stride 是 constexpr，编译器能识别 broadcast stride 并做地址布局
+优化。手写 fixed-rank kernel 则把 shape/stride 作为运行时参数，并固定
+`BLOCK_SIZE=1024` 产生 1024 个 program，在 P800 上退化成大量 block 调度和标量
+local/global memory 往返，性能差两个数量级。
+
+300 次 iteration 的 stable 结果还显示：
+
+```text
+expanded aten dispatch:  ~0.039 ms/iter
+expanded direct kernel:  ~0.023 ms/iter
+```
+
+两者差值主要是 host/dispatch 与 Python wrapper 开销；对原来的 ~3.3 ms kernel，
+完整调用仍约提升 85 倍。
+
+因此最终方案是：删除 `src.is_contiguous()` 限制，所有可安全处理的 strided source
+和 destination 都直接走 `_copy_kernel.instantiate(rank)`；不再保留 fixed-rank
+stride kernel，也自然解除 rank 5 限制。
+
 ### Kernel
 
-`_copy_strided_kernel` 接收：
-
-- source / destination 指针；
-- 5 维 shape；
-- 5 维 source stride；
-- 5 维 destination stride；
-- element 数量；
-- block size。
-
-缺失维度由 host 侧补：
-
-```text
-shape = 1
-stride = 0
-``+
-
-kernel 内：
-
-```text
-offset = pid * BLOCK_SIZE + arange(BLOCK_SIZE)
-remaining = offset
-coord_i = remaining % shape_i
-remaining //= shape_i
-```
-
-再分别计算 source / destination offset。dtype 转换在 store 前完成：
+FlagGems `pointwise_dynamic` 会按 rank 生成类似下面的索引逻辑（以 rank 2 为例）：
 
 ```python
-value.to(dst_ptr.type.element_ty)
+i1 = tid % s1
+tid //= s1
+i0 = tid
+
+src = in0_ptr + i0 * in0_stride0 + i1 * in0_stride1
+dst = out0_ptr + i0 * out0_stride0 + i1 * out0_stride1
 ```
+
+dtype 转换仍由 pointwise 生成代码完成。非法 layout、跨设备、quantized、complex ->
+real、内部重叠 destination 等情况继续走原有 fallback 或报错。
 
 ### 分流
 
 ```python
-if (
-    not expanded_src.is_contiguous() or not dst.is_contiguous()
-) and expanded_src.ndim <= 5:
-    _copy_strided(dst, expanded_src)
-    return dst
+expanded_src = src.expand(dst.shape)
+overload = _copy_kernel.instantiate(expanded_src.ndim)
+overload(expanded_src, out0=dst)
 ```
 
-连续路径仍走：
-
-```python
-_copy_kernel.instantiate(...)
-```
-
-rank>5 非连续输入也继续走 `pointwise_dynamic` 动态生成路径。
+连续与非连续 source 不再分成两套 Triton kernel，减少维护成本并复用 vendor tuning。
 
 ## 测试矩阵
 
@@ -118,8 +132,8 @@ rank>5 非连续输入也继续走 `pointwise_dynamic` 动态生成路径。
 - rank 2；
 - rank 3；
 - rank 4；
-- rank 5：显式 kernel 最大支持 rank；
-- rank 6：pointwise_dynamic 路径；
+- rank 5；
+- rank 6；
 - transposed source；
 - sliced destination。
 
