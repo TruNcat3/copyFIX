@@ -40,22 +40,22 @@ if not _can_use_triton(dst, src):
 
 ## 新实现
 
-### 性能定位（2026-09-11）
+### 性能 / 精度定位（2026-09-11）
 
-在 P800、`(1024, 1024)` fp32 上观察到：
+在 P800 XPU 0、`(1024, 1024)` fp32 上，初版观察为：
 
 ```text
 copy contiguous: 0.040 ms/iter
 copy expanded:   2.408 ms/iter   # 第一版 fixed-rank kernel
 ```
 
-补充对比 direct `_copy_strided` 与 FlagGems 生成 `_copy_kernel` 后，结论更直接：
+使用 `tests/bench_copy.py --warmup 30 --iters 200` 复测后，结论更直接：
 
 ```text
-contiguous via aten dispatch:     ~0.039 ms/iter
-expanded via aten dispatch:       ~0.039 ms/iter
-expanded via direct pointwise:    ~0.023 ms/iter
-expanded via fixed-rank kernel:   ~3.3   ms/iter
+contiguous aten dispatch:       0.042 ms/iter
+expanded aten dispatch:         0.040 ms/iter
+expanded direct pointwise:      0.026 ms/iter
+expanded legacy fixed-rank:     2.401 ms/iter
 ```
 
 `pointwise_dynamic` 不是只能处理连续输入。它生成 kernel 时同时传入 source /
@@ -65,15 +65,13 @@ destination 的真实 strides，并使用 KunlunXIN 后端调优过的 12-CTA gr
 `BLOCK_SIZE=1024` 产生 1024 个 program，在 P800 上退化成大量 block 调度和标量
 local/global memory 往返，性能差两个数量级。
 
-300 次 iteration 的 stable 结果还显示：
+主 expanded fp32 用例中，direct kernel 提升 **91.58x**；包含 PyTorch dispatch 与
+Python 检查的完整调用提升 **59.29x**。两者差值是 host/dispatch 开销。
 
-```text
-expanded aten dispatch:  ~0.039 ms/iter
-expanded direct kernel:  ~0.023 ms/iter
-```
-
-两者差值主要是 host/dispatch 与 Python wrapper 开销；对原来的 ~3.3 ms kernel，
-完整调用仍约提升 85 倍。
+完整性能与精度矩阵见
+[PERFORMANCE_ACCURACY.md](PERFORMANCE_ACCURACY.md)。所有 tested 路径与 CPU
+reference 均 `torch.equal`，`max_abs_err=0`；原 native fallback 在非连续 source 上
+直接抛 `invalid device function`，无法参与精度比较。
 
 因此最终方案是：删除 `src.is_contiguous()` 限制，所有可安全处理的 strided source
 和 destination 都直接走 `_copy_kernel.instantiate(rank)`；不再保留 fixed-rank

@@ -66,6 +66,11 @@ KunlunXIN 后端的 12-CTA grid/tile 策略。
 ```text
 ├── README.md                     # 本文
 ├── copy.patch                    # FlagGems 最小算子 patch（只改 copy.py）
+├── docs/
+│   ├── COPY_REPORT.md             # 根因、实现与测试报告
+│   └── PERFORMANCE_ACCURACY.md    # P800 性能 / 精度对比
+├── results/
+│   └── copy_perf_accuracy_p800.json
 ├── src/
 │   ├── copy.py                   # 修复后的完整 KunlunXIN copy_ 文件
 │   └── copy.py.orig              # 修改前备份
@@ -75,7 +80,7 @@ KunlunXIN 后端的 12-CTA grid/tile 策略。
     ├── test_rank_coverage.py     # rank 1-6 与 destination stride 覆盖
     ├── gap_checks.py             # empty / rank6 /非法 broadcast / overlap 写入
     ├── test_sdpa_e2e.py          # expanded mask 进入真实 SDPA 计算
-    ├── bench_copy.py             # 连续与非连续路径性能观察
+    ├── bench_copy.py             # 性能 / 精度矩阵 benchmark
     └── test_copy.py              # FlagGems pytest 集成测试
 ```
 
@@ -130,8 +135,12 @@ pytest -q tests/test_copy_ops.py
 性能观察：
 
 ```bash
-python tests/bench_copy.py
+CUDA_VISIBLE_DEVICES=0 \
+  python tests/bench_copy.py --warmup 30 --iters 200 \
+  --json results/copy_perf_accuracy_p800.json
 ```
+
+详细数据和精度矩阵见 [docs/PERFORMANCE_ACCURACY.md](docs/PERFORMANCE_ACCURACY.md)。
 
 ## 已知边界
 
@@ -139,15 +148,15 @@ python tests/bench_copy.py
 - 内部重叠 destination 会拒绝写入，与 PyTorch 行为一致；
 - bench 只提供当前机器的趋势观察，不作为严格性能回归结论。
 
-P800 `(1024, 1024)` fp32 观察：
+P800 `(1024, 1024)` fp32 最新观察：
 
 ```text
-contiguous aten dispatch:     ~0.039 ms/iter
-expanded aten dispatch:       ~0.039 ms/iter
-expanded direct pointwise:    ~0.023 ms/iter
-旧 fixed-rank stride kernel:  ~3.3   ms/iter
+contiguous aten dispatch:       0.042 ms/iter
+expanded aten dispatch:         0.040 ms/iter
+expanded direct pointwise:      0.026 ms/iter
+legacy fixed-rank kernel:       2.401 ms/iter
 ```
 
-实际 dispatch 与 direct kernel 的差距是 host/dispatch 开销；kernel 本身约提速
-140 倍，完整 `copy_` 调用约提速 85 倍。最终不新增手写 fixed-rank kernel，直接复用
-`pointwise_dynamic`。
+实际 dispatch 与 direct kernel 的差距是 host/dispatch 开销；kernel 本身提速
+**91.58x**，完整 `copy_` 调用相对 legacy kernel 提速 **59.29x**。最终不新增手写
+fixed-rank kernel，直接复用 `pointwise_dynamic`。
